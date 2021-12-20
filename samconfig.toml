@@ -1,0 +1,12 @@
+version = 0.1
+[default]
+[default.deploy]
+[default.deploy.parameters]
+stack_name = "us-east-deployment"
+s3_bucket = "aws-sam-cli-managed-default-samclisourcebucket-13dy36tp5fmh1"
+s3_prefix = "us-east-deployment"
+region = "us-east-1"
+confirm_changeset = true
+capabilities = "CAPABILITY_NAMED_IAM"
+parameter_overrides = "HostedZoneID=\"Z07166721R60TR8Y99VZN\""
+image_repositories = []

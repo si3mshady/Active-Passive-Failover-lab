@@ -1,0 +1,213 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  active passive failover lab 
+#get the ip of the load balancer 
+Parameters:
+  HostedZoneID:
+   Type: String
+   Default: Z07166721R60TR8Y99VZN #a hosted zone is a container for DNS records
+Mappings:
+  "698347480743":
+    us-east-1:
+        subnet1: subnet-0d6a41948951fcf98 #10.0.0.0/24 us-east-1b 
+        subnet2: subnet-0e7db2f41eced0ba7 #10.0.1.0/25 us-east-1c
+        securityGroup: sg-038e75502a4490008
+        vpc:  vpc-0bf286c4707e7c436 
+        
+    ca-central-1: 
+        subnet1: subnet-011ec6bca32ccdc38
+        subnet2: subnet-066c140e363e316fa
+        securityGroup: sg-0a651e25151429641
+        vpc: vpc-08ec9190cdbd235bf
+  
+Conditions:
+  usEast: !Equals 
+    - !Ref AWS::Region
+    - us-east-1
+  canada: !Equals 
+    - !Ref AWS::Region
+    - ca-central-1
+    
+
+Resources:
+  ApplicationDNSEast:  
+    Type: AWS::Route53::RecordSetGroup
+    Condition: usEast
+    DependsOn:   APALB
+    Properties:     
+      HostedZoneId: !Ref HostedZoneID   
+   
+      RecordSets: 
+         -  Name: elliott.arnold.twoweeksprints.com
+            Failover: PRIMARY
+            Type: CNAME
+            TTL: '10'
+            SetIdentifier: Test-Application-us-east-1
+            HealthCheckId: !Ref EastRoute53Check            
+            ResourceRecords:
+            - !GetAtt APALB.DNSName
+
+  ApplicationDNSCanada:    
+      Type: AWS::Route53::RecordSetGroup
+      Condition: canada
+      DependsOn:   APALB
+      Properties:     
+        HostedZoneId: !Ref HostedZoneID   
+  
+        RecordSets: 
+          -   Name: elliott.arnold.twoweeksprints.com
+              Failover: SECONDARY
+              HealthCheckId: !Ref CanadaRoute53Check
+              Type: CNAME
+              TTL: '10'
+              SetIdentifier: Test-Application-canada
+           
+              ResourceRecords:
+              - !GetAtt APALB.DNSName
+
+  EastRoute53Check:
+      Type: AWS::Route53::HealthCheck
+      Condition: usEast
+      Properties: 
+        HealthCheckConfig:
+          Port: 80
+          Type: HTTP
+          ResourcePath: '/health'
+          IPAddress: 3.234.19.177 #use nslookup to get ALB ipv4 address 
+          RequestInterval: 30
+          FailureThreshold: 3
+        
+  CanadaRoute53Check:
+      Type: AWS::Route53::HealthCheck
+      Condition: canada
+      Properties: 
+        HealthCheckConfig:       
+          Port: 80
+          Type: HTTP
+          ResourcePath: '/health'
+          IPAddress: 3.97.38.113 #use nslookup to get the public IP of load balancer
+          RequestInterval: 30
+          FailureThreshold: 3
+         
+
+  ActivePassiveCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub 'ActivePassiveCluster-${AWS::Region}-dev'
+  APALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties: 
+      LoadBalancerAttributes:
+        - Key: idle_timeout.timeout_seconds
+          Value: '90'
+      IpAddressType: ipv4     
+      Name: !Sub 'apalb-${AWS::Region}-dev'
+      SecurityGroups: 
+        - !FindInMap [ !Ref "AWS::AccountId", !Ref "AWS::Region", securityGroup]
+      Subnets: 
+        - !FindInMap [ !Ref "AWS::AccountId", !Ref "AWS::Region", subnet1]
+        - !FindInMap [ !Ref "AWS::AccountId", !Ref "AWS::Region", subnet2]
+      Type: application
+
+
+  healthCheckTaskDef:
+    Type: AWS::ECS::TaskDefinition            
+    Properties:             
+      ExecutionRoleArn:  !Ref EcsExecRole
+      TaskRoleArn: !Ref ContainerTaskRole
+      Cpu: 256
+      Memory: 512
+      NetworkMode: awsvpc
+      
+      ContainerDefinitions:
+        - Name: healthCheck 
+          Essential: 'true'
+          Image: "si3mshady/healthcheck-activepassive:2"
+          Cpu: 256
+          Memory : 512
+          PortMappings: 
+            - ContainerPort: 80             
+              HostPort: 80
+              Protocol: tcp     
+                   
+
+      RequiresCompatibilities:
+        - "FARGATE"
+
+ 
+  healthCheckService:
+    Type: AWS::ECS::Service
+    DependsOn: HealthCheckListener
+    Properties:
+      ServiceName: !Sub 'healthCheckService-${AWS::Region}-dev'
+      LoadBalancers:
+        - ContainerPort: 80
+          ContainerName:  healthCheck
+          TargetGroupArn: !Ref HealthCheckTG  
+
+      Cluster: 
+        Ref: ActivePassiveCluster
+      TaskDefinition: !Ref  healthCheckTaskDef
+      LaunchType:  FARGATE  #FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets:
+            - !FindInMap [ !Ref "AWS::AccountId", !Ref "AWS::Region", subnet1]
+            - !FindInMap [ !Ref "AWS::AccountId", !Ref "AWS::Region", subnet2]
+          SecurityGroups:
+            - !FindInMap [!Ref "AWS::AccountId", !Ref "AWS::Region" , securityGroup]
+
+  EcsExecRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'EcsExecRole-${AWS::Region}'
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy'
+  # A role for the containers
+  
+  ContainerTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'ContainerTaskRole-${AWS::Region}-dev'
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: 'sts:AssumeRole'
+ 
+  HealthCheckTG:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckIntervalSeconds: 6
+      HealthCheckPath: /health
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      TargetType: ip
+      Name: !Sub 'healthCheckTG-${AWS::Region}-dev'
+      Port: 80
+      Protocol: HTTP
+      UnhealthyThresholdCount: 2
+      VpcId: !FindInMap [ !Ref "AWS::AccountId", !Ref "AWS::Region", vpc]          
+
+
+
+  HealthCheckListener:
+    Type: 'AWS::ElasticLoadBalancingV2::Listener'
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref  HealthCheckTG
+      LoadBalancerArn: !Ref APALB
+      Port: 80
+      Protocol: HTTP
+
